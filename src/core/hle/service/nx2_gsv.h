@@ -3,6 +3,17 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+
+// Time of the last large movie frame the Switch 2 video decoder output (EDEN_MKW_MOVIE_UNPACED).
+inline std::atomic<std::int64_t>& Nx2MkwMovieFrameClock() {
+    static std::atomic<std::int64_t> clock{0};
+    return clock;
+}
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -2528,6 +2539,22 @@ private:
             m_frame_trace.sleep_actual_ms = 0;
             m_frame_trace.deadline_reset = false;
         }
+        // EDEN_MKW_MOVIE_UNPACED=1: no present pacing while a large (>= 1920 wide) movie plays.
+        // The pacing sleep starves Mario Kart World's movie player: its 2560x1440 cup intros ran
+        // at ~70% speed with stuttering sound (~35% with the game's 30 FPS mode).
+        static const bool mkw_movie_unpaced = [] {
+            const char* v = std::getenv("EDEN_MKW_MOVIE_UNPACED");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (mkw_movie_unpaced) {
+            const auto mkw_last = Nx2MkwMovieFrameClock().load(std::memory_order_relaxed);
+            const auto mkw_now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (mkw_last != 0 && mkw_now - mkw_last < 250'000'000) {
+                m_present_pacer = Nx2PresentPacer{};
+                return;
+            }
+        }
         static const u32 forced_interval = [] {
             const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
             return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
@@ -3882,6 +3909,15 @@ private:
                     WaitForRelease(*fence);
                 }
                 const auto [width, height] = WriteImage(decoder.get(), image, frame, bytes);
+                // Stamp every written movie frame, fenced or not: images from RegisterBuffer
+                // come without release fences, so a short clip would otherwise stay paced.
+                if (m_width >= 1920) {
+                    Nx2MkwMovieFrameClock().store(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count(),
+                        std::memory_order_relaxed);
+                }
                 lk.lock();
                 // Even an image written during a flush counts: the client waits for its value.
                 m_outputs.push_back({image, width, height, frame.pts, frame.end});
